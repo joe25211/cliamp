@@ -445,3 +445,138 @@ func TestRemoteRequiresClassifiedURLs(t *testing.T) {
 		t.Fatal("Remote accepted an unclassified stream URL; URL is no longer needed")
 	}
 }
+
+// TestResolveM3UCapsBody pins that an oversized remote M3U track list is
+// rejected rather than silently truncated. This is the mirror of
+// TestResolvePLSCapsBody: io.LimitReader alone cuts mid-line, and parseM3U
+// turns the partial "http://example.com/9" into a track with a non-URL path,
+// which the player then treats as a local file.
+func TestResolveM3UCapsBody(t *testing.T) {
+	oversized := buildM3U(30000)
+	if len(oversized) <= maxPlaylistBody {
+		t.Fatalf("fixture is %d bytes, needs to exceed maxPlaylistBody (%d)", len(oversized), maxPlaylistBody)
+	}
+
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+		want    int
+	}{
+		{name: "under the cap", body: buildM3U(10), want: 10},
+		{name: "over the cap", body: oversized, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "audio/x-mpegurl")
+				io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+
+			tracks, err := resolveM3U(srv.URL + "/stations.m3u")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolveM3U accepted a %d-byte body and returned %d tracks, want an error",
+						len(tt.body), len(tracks))
+				}
+				if !strings.Contains(err.Error(), "exceeds") {
+					t.Fatalf("error = %v, want it to name the cap", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveM3U returned error: %v", err)
+			}
+			if len(tracks) != tt.want {
+				t.Fatalf("got %d tracks, want %d", len(tracks), tt.want)
+			}
+			for i, tr := range tracks {
+				if !playlist.IsURL(tr.Path) {
+					t.Fatalf("tracks[%d].Path = %q, want a URL: a truncated entry must never reach the playlist", i, tr.Path)
+				}
+			}
+		})
+	}
+}
+
+func buildM3U(entries int) string {
+	var sb strings.Builder
+	sb.WriteString("#EXTM3U\n")
+	for i := 1; i <= entries; i++ {
+		fmt.Fprintf(&sb, "#EXTINF:-1,Station %d\nhttps://example.com/%d.mp3\n", i, i)
+	}
+	return sb.String()
+}
+
+// TestResolveM3UDoesNotCapHLS pins the carve-out that separates this from the
+// PLS fix. An HLS body is never parsed into a track list, only sniffed for its
+// #EXT-X-* markers, and a long VOD media playlist legitimately runs past the
+// cap. Capping it would reject streams that work today, so the size check must
+// stay below the HLS branch.
+func TestResolveM3UDoesNotCapHLS(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n")
+	for i := 0; sb.Len() <= maxPlaylistBody; i++ {
+		fmt.Fprintf(&sb, "#EXTINF:6.0,\nsegment_%06d.ts\n", i)
+	}
+	media := sb.String()
+	if len(media) <= maxPlaylistBody {
+		t.Fatalf("fixture is %d bytes, needs to exceed maxPlaylistBody (%d)", len(media), maxPlaylistBody)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		io.WriteString(w, media)
+	}))
+	defer srv.Close()
+
+	u := srv.URL + "/live/media.m3u8"
+	tracks, err := resolveM3U(u)
+	if err != nil {
+		t.Fatalf("resolveM3U rejected an oversized HLS playlist: %v", err)
+	}
+	if len(tracks) != 1 {
+		t.Fatalf("got %d tracks, want 1 (HLS = single stream)", len(tracks))
+	}
+	if tracks[0].Path != u {
+		t.Errorf("Path = %q, want the original URL %q", tracks[0].Path, u)
+	}
+	if !tracks[0].Stream {
+		t.Error("Stream should be true")
+	}
+}
+
+// TestResolveM3UStopsReadingAtTheCap pins that the cap bounds the read itself,
+// not just the size check afterwards. Without the LimitReader the whole body is
+// pulled into memory before its length is ever examined, which is the condition
+// the cap exists to prevent.
+func TestResolveM3UStopsReadingAtTheCap(t *testing.T) {
+	const served = 32 << 20 // far more than maxPlaylistBody
+
+	var written atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/x-mpegurl")
+		io.WriteString(w, "#EXTM3U\n")
+		chunk := []byte(strings.Repeat("https://example.com/1.mp3\n", 2048))
+		for written.Load() < served {
+			n, err := w.Write(chunk)
+			written.Add(int64(n))
+			if err != nil {
+				return // client stopped reading, which is the point
+			}
+		}
+	}))
+	defer srv.Close()
+
+	if _, err := resolveM3U(srv.URL + "/endless.m3u"); err == nil {
+		t.Fatal("resolveM3U accepted an oversized body, want an error")
+	}
+
+	// Allow generous slack for socket and proxy buffering; without the cap the
+	// server drains all 32 MB.
+	if got := written.Load(); got >= served/2 {
+		t.Fatalf("server wrote %d bytes before the client stopped, want well under %d", got, served)
+	}
+}

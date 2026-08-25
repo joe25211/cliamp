@@ -466,9 +466,12 @@ func resolveM3U(m3uURL string) ([]playlist.Track, error) {
 		return nil, fmt.Errorf("http status %s", resp.Status)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistBody))
+	// Read one byte past the cap so an oversized track list is reported rather
+	// than silently truncated: io.LimitReader alone would cut mid-line and hand
+	// parseM3U a partial "https://example.com/9", which becomes a bogus track.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistBody+1))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading m3u playlist: %w", err)
 	}
 
 	if isHLSPlaylist(body) {
@@ -480,6 +483,13 @@ func resolveM3U(m3uURL string) ([]playlist.Track, error) {
 		// master playlist is conservatively treated as live.
 		t.Realtime = !bytes.Contains(body, []byte("#EXT-X-ENDLIST"))
 		return []playlist.Track{t}, nil
+	}
+
+	// Only the track-list path is capped. An HLS playlist above is returned as a
+	// single stream whose body is never parsed, and a long VOD media playlist
+	// legitimately exceeds the cap, so rejecting it would break real streams.
+	if len(body) > maxPlaylistBody {
+		return nil, fmt.Errorf("m3u playlist exceeds %d bytes", maxPlaylistBody)
 	}
 
 	entries, err := parseM3U(bytes.NewReader(body), "")
